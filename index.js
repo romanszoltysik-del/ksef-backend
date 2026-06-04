@@ -9,9 +9,10 @@ const KSEF_API = "https://ksef.mf.gov.pl/api";
 const TOKEN = process.env.KSEF_TOKEN;
 const NIP = process.env.KSEF_NIP;
 
-// Pomocnicza funkcja do zapytań do KSeF
 async function ksefFetch(path, options = {}) {
-  const res = await fetch(`${KSEF_API}${path}`, {
+  const url = `${KSEF_API}${path}`;
+  console.log("KSeF request:", options.method || "GET", url);
+  const res = await fetch(url, {
     ...options,
     headers: {
       "Content-Type": "application/json",
@@ -19,14 +20,17 @@ async function ksefFetch(path, options = {}) {
       ...(options.headers || {}),
     },
   });
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`KSeF error ${res.status}: ${txt}`);
+  const text = await res.text();
+  console.log("KSeF response status:", res.status);
+  console.log("KSeF response body (first 500):", text.substring(0, 500));
+  if (!res.ok) throw new Error(`KSeF ${res.status}: ${text.substring(0, 300)}`);
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`KSeF zwrócił HTML zamiast JSON: ${text.substring(0, 200)}`);
   }
-  return res.json();
 }
 
-// Otwórz sesję z tokenem
 async function openSession() {
   const body = {
     contextIdentifier: { type: "onip", identifier: NIP },
@@ -39,31 +43,26 @@ async function openSession() {
   return data.sessionToken.token;
 }
 
-// Zamknij sesję
 async function closeSession(sessionToken) {
-  await ksefFetch("/online/Session/Terminate", {
-    method: "GET",
-    headers: { "SessionToken": sessionToken },
-  }).catch(() => {});
+  try {
+    await ksefFetch("/online/Session/Terminate", {
+      method: "GET",
+      headers: { "SessionToken": sessionToken },
+    });
+  } catch(e) { console.log("closeSession error (ignored):", e.message); }
 }
 
-// GET /faktury?typ=otrzymane|wystawione&od=2026-01-01&do=2026-12-31
 app.get("/faktury", async (req, res) => {
   const { typ = "otrzymane", od, do: doDate } = req.query;
-
-  // Daty domyślne: bieżący rok
   const now = new Date();
   const dateFrom = od || `${now.getFullYear()}-01-01`;
   const dateTo = doDate || now.toISOString().split("T")[0];
-
-  // Kierunek: 1 = otrzymane, 2 = wystawione
   const subjectType = typ === "wystawione" ? "subject1" : "subject3";
 
   let sessionToken;
   try {
     sessionToken = await openSession();
 
-    // Inicjuj zapytanie o faktury
     const queryBody = {
       queryCriteria: {
         subjectType,
@@ -80,7 +79,6 @@ app.get("/faktury", async (req, res) => {
       body: JSON.stringify(queryBody),
     });
 
-    // Zbierz faktury z odpowiedzi
     const faktury = (queryResult.invoiceHeaderList || []).map(inv => ({
       id: inv.invoiceReferenceNumber || inv.ksefReferenceNumber,
       ksefId: inv.ksefReferenceNumber,
@@ -89,7 +87,7 @@ app.get("/faktury", async (req, res) => {
       kwota: parseFloat(inv.gross || inv.net || 0),
       data: inv.invoicingDate?.split("T")[0] || "",
       termin: inv.paymentDate?.split("T")[0] || "",
-      status: "niezapłacona", // KSeF nie zwraca statusu płatności – trzeba śledzić samodzielnie
+      status: "niezapłacona",
       waluta: inv.currency || "PLN",
     }));
 
@@ -98,13 +96,32 @@ app.get("/faktury", async (req, res) => {
 
   } catch (err) {
     if (sessionToken) await closeSession(sessionToken);
-    console.error(err.message);
+    console.error("ERROR:", err.message);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// Health check
-app.get("/", (req, res) => res.json({ status: "ok", info: "KSeF Proxy API" }));
+// Diagnostyczny endpoint - pokaż dokładny błąd z KSeF
+app.get("/test-sesja", async (req, res) => {
+  try {
+    const body = {
+      contextIdentifier: { type: "onip", identifier: NIP },
+      authorisationToken: TOKEN,
+    };
+    const url = `${KSEF_API}/online/Session/AuthorisedWithToken`;
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const text = await r.text();
+    res.json({ status: r.status, nip: NIP, tokenLength: TOKEN?.length, body: text.substring(0, 1000) });
+  } catch(e) {
+    res.json({ error: e.message });
+  }
+});
+
+app.get("/", (req, res) => res.json({ status: "ok", info: "KSeF Proxy API v2" }));
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`KSeF backend działa na porcie ${PORT}`));
+app.listen(PORT, () => console.log(`KSeF backend port ${PORT}`));
